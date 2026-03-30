@@ -4,13 +4,15 @@ from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain.messages import HumanMessage, AIMessage, SystemMessage,ToolMessage
 from langchain.tools import tool
+from langchain_core.tools import StructuredTool
 from chat_history_viewer import messages_to_json
 from pathlib import Path
+import re
+from pydantic import BaseModel,Field
 
 # load env variables
 load_dotenv(override=True)
 MODEL='MiniMax-M2.7'
-
 
 # get a llm agent
 lc_agent=init_chat_model(model=MODEL,
@@ -19,12 +21,57 @@ lc_agent=init_chat_model(model=MODEL,
                        model_provider='anthropic',
                        )
 
+# define skill
+class AgentSkill:
+    def __init__(self, skill_dir:str = './skills'):
+        self.skills={}
+        self.skill_dir=Path(skill_dir)
+        for f in self.skill_dir.rglob("SKILL.md"):
+            text = f.read_text()
+            meta, body = self._parse_frontmatter(text)
+            name = meta.get('name',f.parent.name)
+            description=meta.get('description',None)
+            self.skills[name] = {'name':name, 'description':description, 'body':body, 'path':str(f.resolve())}
+        self.skillprompt='\n'.join([f"skill name:{skill['name']} , skill description:{skill['description']}" for _,skill in self.skills.items()])
+
+    def _parse_frontmatter(self, text: str) -> tuple:
+        """Parse YAML frontmatter between --- delimiters."""
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+        meta = {}
+        lines=match.group(1).strip().splitlines()
+        name_line=lines[0]
+        description_line=''.join(lines[1:])
+        meta['name']=name_line.split(':',1)[1].strip()
+        meta['description']=description_line.split(':',1)[1].strip()
+        return meta, match.group(2).strip()
+
+    def load_skill(self,name:str):
+        skill=self.skills.get(name)
+        if not skill:
+            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        else:
+            return f"skill name: '{name}', skill path: '{skill['path']}', skill content: '{skill['body']}'"
+
+skills=AgentSkill()
 
 # define system_prompt
-System_prompt=SystemMessage(content="You are a smart and professional personal assistant")
+System_prompt=SystemMessage(content=f"You are a smart and professional personal assistant , your avaliable skills:{skills.skillprompt} , when you need a skill you can use load_skill tool to obtain the specific usage method of skill")
 
 # define tools
 tools=[]
+
+# define load skill tool
+class skill(BaseModel):
+    name:str
+
+load_skill = StructuredTool.from_function(
+                    func=skills.load_skill,
+                    name="load_skill",
+                    description="Obtain the specific usage method of skill",
+                    args_schema=skill,
+                )
 
 # safe sandbox
 def safe_path(filepath:str) -> Path | str:
@@ -104,13 +151,14 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-tools=[run_bash,run_read,run_write,run_edit]
+tools=[run_bash,run_read,run_write,run_edit,load_skill]
 
 # bind tools
 lc_agent=lc_agent.bind_tools(tools)
 
 # define a tool execute function
-tools_dict={"run_bash":run_bash,"run_read":run_read,"run_write":run_write,"run_edit":run_edit}
+tools_dict={"run_bash":run_bash,"run_read":run_read,"run_write":run_write,"run_edit":run_edit,"load_skill":load_skill}
+
 def execute_tool(tool_call:dict) -> ToolMessage: 
     tool_name=tool_call["name"]
     tool= tools_dict.get(tool_name,None)
