@@ -7,8 +7,9 @@ from langchain.tools import tool
 from langchain_core.tools import StructuredTool
 from chat_history_viewer import messages_to_json
 from pathlib import Path
-from typing import List,Literal
+from typing import List,Literal,Optional
 from pydantic import BaseModel,Field
+import json
 
 # load env variables
 load_dotenv(override=True)
@@ -31,42 +32,109 @@ tools=[]
 
 # define the task type
 class Task(BaseModel):
-    id:str = Field(description="unique task identifier")
-    content: str = Field(description="task content")
-    status: Literal["pending","in_progress","completed"] = Field(description="the status of the task")
+    id: str = Field(description="unique task identifier, when you want to check a task, you only need input the id, and other properties can be None")
+    content: Optional[str] = Field(description="task content")
+    status: Literal["pending","in_progress","completed",None] = Field(description="the status of the task.")
+    block: Optional[List[str]] = Field(description="Which tasks does this task block ? Give their ids")
+    blocked_by:Optional[List[str]] = Field(description="Which tasks does this task blocked by ? Give their ids")
 
 class TaskList(BaseModel):
     tasks: List[Task] = Field(description="the task list")
+    operation:Literal['add','del','edit','check'] = Field(description=
+                                                          "What operation do you want to perform on the task ? "
+                                                          "add: add task to the task list; " \
+                                                          "del: delete a task; " \
+                                                          "edit: edit the properties of task; " \
+                                                          "check: check the properties of task ")
+
+Task_Dir=Path('./task')
+Task_Dir.mkdir(exist_ok=True)
 
 # define a TaskManager
 class TaskManager:
+    # task CRUD
     def __init__(self):
-        self.tasks=[]
+        self.tasks={}
+        self.task_list_path=f'{Task_Dir}/task.json'
+        self.save_task_list()
     
-    def manager_task_list(self,tasks:List[Task]):
-        valid=[]
-        for index,task in enumerate(tasks):
-            if not task.id:
-                task.id=str(f"task:{index+1}")
-            if not task.content:
-                raise ValueError(f"The task {task.id} is empty")
-            if task.status not in ["pending","in_progress","completed"]:
-                raise ValueError(f"The status of task {task.id} is invalid ")
-            valid.append({'id':task.id,'content':task.content,'status':task.status})
-        self.tasks=valid
-        return f"Successfully update the task list!"
+    # add del change edit
+    def task_list_operations(self,tasks:List[Task],operation:Literal['add','del','edit','check']):
+        # add
+        if operation == 'add':
+            for index,task in enumerate(tasks):
+                if not task.id:
+                    task.id=str(f"task:{index+1}")
+                if not task.content:
+                    raise ValueError(f"The task {task.id} is empty")
+                if task.status not in ["pending","in_progress","completed"]:
+                    raise ValueError(f"The status of task {task.id} is invalid ")
+                self.tasks[task.id]={'id':task.id, 'content':task.content, 'status':task.status, 'block':task.block, 'blocked_by':task.blocked_by}
+            self.save_task_list()
+            return "Successfully add the task!"
+        # del
+        elif operation == 'del':
+            result={'DeletionSuccessful':[],'DeletionFailed':[]}
+            for task in tasks:
+                if task.id in self.tasks:
+                    del self.tasks[task.id]
+                    result['DeletionSuccessful'].append(task.id)
+                else:
+                    result['DeletionFailed'].append(task.id)
+            if len(result['DeletionSuccessful']) > 0:
+                self.save_task_list()
+            return f"DeletionSuccessful: {result['DeletionSuccessful']}, Unkown task id: {result['DeletionFailed']}"
+        # change
+        elif operation == 'edit':
+            result={'EditSuccessful':[],'EditFailed':[]}
+            for task in tasks:
+                if task.id in self.tasks:
+                    self.tasks[task.id]['content'] = task.content
+                    self.tasks[task.id]['status'] = task.status
+                    self.tasks[task.id]['block'] = task.block
+                    self.tasks[task.id]['blocked_by'] = task.blocked_by
+                    result['EditSuccessful'].append(task.id)
+                else:
+                    result['EditFailed'].append(task.id)
+            if len(result['EditSuccessful']) > 0:
+                self.save_task_list()
+            return f"EditSuccessful: {result['EditSuccessful']}, Unkown task id: {result['EditFailed']}"
+        # check
+        elif operation == 'check':
+            result={}
+            for task in tasks:
+                if task.id in self.tasks:
+                    result[task.id]=self.tasks[id]
+                else:
+                    result[task.id]="Unkonwn task id"
+            return result      
+    
+    def save_task_list(self):
+        with open(self.task_list_path,'w',encoding='utf-8') as f:
+            json.dump(self.tasks, f, indent=2, ensure_ascii=False)   
+            return f"Successfully updated the task list!"
+    
+    def get_task_list(self):
+        with open(self.task_list_path,'r',encoding='utf-8') as f:
+            text=json.load(f)
+        return text
     
 # instanciate a TaskManager 
 task_manager=TaskManager()
 
 # construct the tool function from instance method with args schema
-task_manager_tool = StructuredTool.from_function(
-                    func=task_manager.manager_task_list,
-                    name="task_manager_tool",
-                    description="Make a todo list and manager its state",
+task_list_operations = StructuredTool.from_function(
+                    func=task_manager.task_list_operations,
+                    name="task_list_operations",
+                    description="create and mangaer the task list",
                     args_schema=TaskList,
                 )
 
+get_task_list = StructuredTool.from_function(
+                    func=task_manager.get_task_list,
+                    name="get_task_list",
+                    description="get the task list",
+                )
 # safe sandbox
 def safe_path(filepath:str) -> Path | str:
     parent=os.getcwd()
@@ -143,13 +211,13 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-tools=[run_bash,run_read,run_write,run_edit,task_manager_tool]
+tools=[run_bash,run_read,run_write,run_edit,task_list_operations,get_task_list]
 
 # bind tools
 lc_agent=lc_agent.bind_tools(tools)
 
 # define a tool execute function
-tools_dict={"run_bash":run_bash,"run_read":run_read,"run_write":run_write,"run_edit":run_edit,"task_manager_tool":task_manager_tool}
+tools_dict={"run_bash":run_bash,"run_read":run_read,"run_write":run_write,"run_edit":run_edit,"task_list_operations":task_list_operations,"get_task_list":get_task_list}
 
 def execute_tool(tool_call:dict) -> SystemMessage | ToolMessage:     
     tool_name=tool_call["name"]
@@ -176,7 +244,7 @@ def agent_loop(messages):
         
         # process tool invocation
         if response.tool_calls:
-            # print("--"*20,"tool_use","--"*20)
+            print("--"*20,"tool_use","--"*20)
             for tool_call in response.tool_calls:
                 tool_result=execute_tool(tool_call)
                 messages.append(tool_result)
